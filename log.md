@@ -10,6 +10,19 @@ lat, lon
 
 [road_network link](https://data.gov.hk/en-data/dataset/hk-td-tis_15-road-network-v2/resource/38eec12e-6b66-489a-9a1b-736598ab16fd)
 
+
+1. make a lookup dict:
+    key: midpoint/junction
+    value: list of other midpoint/junctions that this one connects to (via a road)
+for astar, just use the lookup dict
+
+2. kdtree was for initial address lookup (arbitrary input, osm_gdf, gov_gdf)
+
+
+
+
+
+
 gdf layers:
 ['VEHICLE_RESTRICTION', 'TRAFFIC_FEATURES', 'SPEED_LIMIT', 'RUN_IN_OUT', 'ROUNDABOUT', 'PROHIBITION', 'PERMIT', 'PEDESTRIAN_ZONE', 'NSR', 'BUS_ONLY_LANE', 'CENTERLINE', 'TURN', 'INTERSECTION', 'TUN_BRIDGE_TOLL', 'ONSTREETPARK', 'GISP_ON_STREET_PARKING', 'TUN_BRIDGE_TV_TOLL']
 

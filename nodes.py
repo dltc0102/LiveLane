@@ -39,7 +39,8 @@ class AlgoKDTree:
             print(len(self.node_data.keys()))
 
     def get_heuristic(self, query_point: np.array, target_point: np.array) -> float:
-        query_lat, query_lon = tuple((float(thing) for thing in query_point))
+        query_lat = query_point[0]
+        query_lon = query_point[1]
         try:
             queried_data = self.node_data[(query_lat, query_lon)]
         except KeyError:
@@ -132,9 +133,6 @@ def main():
                 'name': key
             }
     start_coords_lst = list(nodes_data_dict.keys())
-    gov_gdf = {}
-    algo_kdtree = AlgoKDTree(gov_gdf, start_coords_lst, nodes_data_dict, k=5)
-    check = algo_kdtree.get_heuristic(start_np, target_np)
     # found_path = algo_kdtree.find_path(start_point, target_point)
     # print(found_path)
 

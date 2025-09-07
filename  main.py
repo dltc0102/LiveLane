@@ -19,7 +19,7 @@ def timer_decorator(start_time):
         def wrapper(*args, **kwargs):
             result = func(*args, **kwargs)
             elapsed = time.time() - start_time
-            print(f"Time elapsed: {elapsed:.4f}s")
+            print(f"Function '{func.__name__}' completed in {elapsed:.4f}s")
             return result
         return wrapper
     return decorator
@@ -64,6 +64,13 @@ def get_gm_api_key() -> str:
     with open("apikey.txt", 'r', encoding='utf-8') as key_f:
         print("GM Api Key Received.")
         return key_f.readline().strip()
+
+@timer_decorator(start_time)
+def get_filepath_by_extension(extension: str) -> str:
+    dataset_fp = os.path.join(os.getcwd(), 'dataset')
+    for file in os.listdir(dataset_fp):
+        if file.endswith(extension):
+            return os.path.join(dataset_fp, file)
 
 
 """-------------------
@@ -160,35 +167,15 @@ def get_pbf_filepath() -> str:
     return file_to_parse
 
 @timer_decorator(start_time)
-def get_all_gdf_data(filepath: str, specified_layer=None) -> gpd.geodataframe.GeoDataFrame:
-    if os.path.isdir(filepath):
-        if specified_layer is not None:
-            gdb_path = os.path.join(filepath, "RdNet_IRNP.gdb")
-            if os.path.exists(gdb_path):
-                filepath = gdb_path
-        else:
-            pbf_pattern = os.path.join(filepath, 'hong-kong-*.osm.pbf')
-            pbf_files = glob.glob(pbf_pattern)
-            filepath = pbf_files[0]
-            print(f"Using OSM file: {os.path.basename(filepath)}")
-
-    if specified_layer is not None:
-        layer_gdf = gpd.read_file(filepath, layer=specified_layer)
-        return layer_gdf
-
-    layers = fiona.listlayers(filepath)
-    gdf_data = {}
-    for layer in layers:
-        layer_gdf = gpd.read_file(filepath, layer=layer)
-        gdf_data[layer] = layer_gdf
-    print(f"All GDF data extracted. {len(layers)} layers found.")
-    return gdf_data
-
-
+def get_all_gdf_data(filepath: str) -> gpd.geodataframe.GeoDataFrame:
+    if filepath.endswith('.pbf'):
+        return gpd.read_file(filename=filepath, layer='lines', columns=["osm_id", "name", "highway", "other_tags", "geometry"])
+    if filepath.endswith('.gdb'):
+        return gpd. read_file(filename=filepath, layer='CENTERLINE', columns=["STREET_ENAME", "STREET_CNAME", "SHAPE_Length", "geometry"])
 
 class OSM_GDF:
-    def __init__(self, gdf_data, api_key, headers, gov_gdf, expressway_limits, start_time):
-        self.gdf_data = gdf_data
+    def __init__(self, pbf_gdf_lines, api_key, headers, gov_gdf, expressway_limits, start_time):
+        self.pbf_gdf_lines = pbf_gdf_lines
         self.api_key = api_key
         self.headers = headers
         self.gov_gdf = gov_gdf
@@ -196,26 +183,24 @@ class OSM_GDF:
         self.start_time = start_time
         self.crs_transformer = Transformer.from_crs("EPSG:2326", "EPSG:4326", always_xy=True)
 
-        # self.points_gdf = gdf_data['points']
-        self.lines_gdf = gdf_data["lines"]
-        # self.mls_gdf = gdf_data["multilinestrings"]
-        # self.mpg_gdf = gdf_data["multipolygons"]
-        # self.other_gdf = gdf_data["other_relations"]
-
         self.lines_nodes = []
         self.lines_nodes_ways = []
-        if not self.lines_gdf.empty:
+        self.lines_ways_data = {}
+        if not self.pbf_gdf_lines.empty:
             self.create_line_nodes()
 
         print(f"# of line nodes {len(self.lines_nodes)}\n")
 
+        if self.lines_nodes_ways:
+            self.lines_ways_data = self.get_line_nodes_ways()
+
     @timer_decorator(start_time)
     def create_line_nodes(self):
         print("Creating Line Nodes...")
-        for idx, line in tqdm(self.lines_gdf.iterrows(), total=len(self.lines_gdf), desc="Creating line nodes"):
+        for idx, line in tqdm(self.pbf_gdf_lines.iterrows(), total=len(self.pbf_gdf_lines), desc="Creating line nodes"):
             if line["name"] is not None:
                 line_node = OSM_LineNode(
-                    self.api_key, self.headers, self.gov_gdf, self.expressway_limits, self.crs_transformer, line["osm_id"], line["name"], line["highway"], line["waterway"], line["aerialway"], line["barrier"], line["man_made"], line["railway"], line["z_order"], line["other_tags"], line["geometry"]
+                    self.api_key, self.headers, self.gov_gdf, self.expressway_limits, self.crs_transformer, line["osm_id"], line["name"], line["highway"], line["other_tags"], line["geometry"]
                 )
                 self.lines_nodes.append(line_node.get_node_data())
                 self.lines_nodes_ways.append(line_node.get_way_data())
@@ -223,8 +208,19 @@ class OSM_GDF:
                 break
         print("All Line Nodes Created.")
 
-    def get_line_nodes_ways(self) -> list:
-        """ returns a list of tuple(first_coord, last_coord) of each line_node """
+    def get_line_nodes_ways(self) -> dict:
+        """ returns a dict of each node
+
+        Key:
+            mid point of the road segment
+
+        Value:
+            0: first coords
+            1: last coords
+            2: street ename
+            3: weight of the road segment
+
+        """
         restructed_dict = {}
         for way_data in self.lines_nodes_ways:
             for way_key, way_value in way_data.items():
@@ -232,19 +228,35 @@ class OSM_GDF:
                 first_coords = way_value['first']
                 last_coords = way_value['last']
                 weight = way_value['weight']
-                restructed_dict[first_coords] = {
+                mid_coords = way_value['midpoint']
+
+                connected_roads = self.query_connected_roads(mid_coords)
+                is_dead_end = True if connected_roads == [] else False
+                restructed_dict[mid_coords] = {
+                    'first': first_coords,
                     'last': last_coords,
                     'name': street_name,
-                    'weight': weight
+                    'weight': weight,
+                    'connected_to': connected_roads,
+                    'is_dead_end': is_dead_end
                 }
         return restructed_dict
+
+    def query_connected_roads(self, queried_point: tuple[float, float]) -> list:
+        is_queried_point_in_dkeys = any(filter(lambda d: queried_point in d, self.lines_nodes_ways))
+        if is_queried_point_in_dkeys:
+            return [d[queried_point] for d in self.lines_nodes_ways if queried_point in d]
+        return []
 
     def get_line_nodes(self) -> list:
         """ Returns a list of line_nodes"""
         return self.lines_nodes
 
+    def get_lines_ways_data(self) -> dict:
+        return self.lines_ways_data
+
 class OSM_LineNode:
-    def __init__(self, api_key, headers, gov_gdf, expressway_limits, crs_transformer, osm_id: int, name: str, highway: str, waterway: str, aerialway: str, barrier: str, man_made: str, railway: str, z_order: int, other_tags, geometry):
+    def __init__(self, api_key, headers, gov_gdf, expressway_limits, crs_transformer, osm_id: int, name: str, highway: str, other_tags, geometry):
         self.api_key = api_key
         self.headers = headers
         self.gov_gdf = gov_gdf
@@ -254,19 +266,14 @@ class OSM_LineNode:
         self.osm_id = osm_id
         self.name = name
         self.highway = highway
-        self.waterway = waterway
-        self.aerialway = aerialway
-        self.barrier = barrier
-        self.man_made = man_made
-        self.railway = railway
-        self.z_order = z_order
         self.other_tags = other_tags
         self.other_tags_data = {}
         self.geometry = geometry
         self.coord_lst = self.get_coords()
         self.first_coords = self.coord_lst[0]
         self.last_coords = self.coord_lst[-1]
-        self.line_distance_km = haversine(self.first_coords, self.last_coords)
+        self.mid_coords = self.get_midpoint_coord()
+        self.line_distance_km = haversine_calc(self.first_coords, self.last_coords)
         self.maxspeed = 0.0
         self.avespeed = 0.0
         self.weight = 0.0
@@ -320,7 +327,7 @@ class OSM_LineNode:
                 self.coord_lst = self.convert_mls(street["geometry"])
                 self.first_coords = self.coord_lst[0]
                 self.last_coords = self.coord_lst[-1]
-                h_dis = haversine(self.first_coords, self.last_coords)
+                h_dis = haversine_calc(self.first_coords, self.last_coords)
                 return float(h_dis)
 
     def get_expressway_speed(self) -> float:
@@ -357,14 +364,8 @@ class OSM_LineNode:
             "en_name": self.en_name,
             "zh_name": self.zh_name,
             "is_highway": self.highway,
-            "is_waterway": self.waterway,
-            "is_aerialway": self.aerialway,
-            "is_barrier": self.barrier,
-            "is_man_made": self.man_made,
-            "is_railway": self.railway,
             "is_oneway": self.is_oneway,
             "is_street": self.is_street,
-            "z_order": self.z_order,
             "coords_lst": self.coord_lst,
             "first_coords": self.first_coords,
             "last_coords": self.last_coords,
@@ -380,7 +381,7 @@ class OSM_LineNode:
 
     def get_way_data(self) -> dict:
         """ Returns way data: {en_name: {first: first_coords, last: last_coords, weight: weight}} """
-        return {self.en_name: {'first': self.first_coords, 'last': self.last_coords, 'weight': self.weight}}
+        return {self.en_name: {'first': self.first_coords, 'last': self.last_coords, 'midpoint': self.mid_coords, 'weight': self.weight}}
 
     def get_coords(self) -> list[tuple[float, float]]:
         """ Takes geometry and converts it into a list of coordinates. (assumes geometry is already in wgs84 format) """
@@ -391,6 +392,12 @@ class OSM_LineNode:
             coords.append(result)
         return coords
 
+    def get_midpoint_coord(self) -> tuple[float, float]:
+        start_lat, start_lon = self.first_coords
+        end_lat, end_lon = self.last_coords
+        mid_lat = (start_lat + end_lat) / 2
+        mid_lon = (start_lon + end_lon) / 2
+        return (mid_lat, mid_lon)
 
 """----------""
    GOV GDF
@@ -450,82 +457,36 @@ def get_expressway_limits(headers: dict) -> dict | None:
 
     return expressway_limits
 
-class RB_KDTree:
-    def __init__(self, gm_api_key, gov_gdf, osm_gdf, top_n):
-        self.gm_api_key: str = gm_api_key
-        self.gov_gdf: gpd.geodataframe.GeoDataFrame = gov_gdf
-        self.osm_gdf: OSM_GDF = osm_gdf
-        self.top_n = top_n # also k
+class initial_KDTree:
+    def __init__(self, query_points, lines_data, osm_gdf, gov_gdf):
+        self.start_point: tuple[float, float] = query_points['start']
+        self.target_point: tuple[float, float] = query_points['target']
+        self.lines_data     : dict = lines_data
+        self.osm_gdf        : OSM_GDF = osm_gdf
+        self.gov_gdf        : gpd.geodataframe.GeoDataFrame = gov_gdf
 
-        self.node_data: dict[dict] = self.osm_gdf.get_line_nodes_ways()
-        self.start_points: list = list(self.node_data.keys())
-        self.kdtree: KDTree = KDTree(self.start_points)
+        self.all_coord_points: list = self.get_all_coords()
+        self.kdtree: KDTree = KDTree(self.all_coord_points)
+        print(self.all_coord_points, len(self.all_coord_points))
 
-    def get_heuristic(self, query_point: np.array, target_point: np.array):
-        query_lat, query_lon = float(query_point[0]), float(query_point[1])
-        try:
-            queried_data = self.node_data[(query_lat, query_lon)]
-        except KeyError:
-            # need to get query point data for street ename, first coords, last coords, weight
-            new_data = self.query_gov_gdf(query_point)
+        if self.kdtree:
+            self.get_initial_nearest_neighbors()
 
-        end_point = queried_data["last"]
-        h_dist = haversine_calc(end_point, target_point)
-        heuristic = h_dist / 110.0 # 110 is max speed possible in hk
-        return heuristic
+    def get_initial_nearest_neighbors(self):
+        distances, indices = self.kdtree.query(self.start_point, k=5)
+        for dists, idx in zip(distances, indices):
+            print(dists, idx)
 
-    def get_k_neighbors(self, query_point) -> list:
-        radius = 1.0
-        distances, indices = self.kdtree.query(query_point, self.top_n, distance_upper_bound=radius)
-        neighbors = []
-        for idx, dist in enumerate(zip(distances, indices)):
-            if dist <= radius and not np.isinf(dist):
-                neighbors.append((self.start_points[indices[idx]], dist))
-        return neighbors
-
-    def find_path(self, start_point: tuple[float, float], target_point: tuple[float, float]) -> float | None:
-        start_np = np.array(start_point)
-        target_np = np.array(target_point)
-        max_search_radius: float = 2.0
-        open_set = [(self.get_heuristic(start_np, target_np), tuple(start_np, 0), 0, [tuple(start_np)])]
-        closed_set = set()
-        g_scores = {tuple(start_np): 0}
-        f_scores = {tuple(start_np): self.get_heuristic(start_np, target_np)}
-
-        while open_set:
-            curr_f, curr, curr_g, curr_path = heapq.heappop(open_set)
-            curr_np = np.array(curr)
-
-            if tuple(curr_np) in closed_set:
-                continue
-
-            closed_set.add(tuple(curr_np))
-
-            if np.allclose(curr_np, target_np, atol=0.1):
-                return curr_path, curr_g
-
-            neighbors = self.get_k_neighbors(curr_np, max_search_radius)
-
-            for neighbor, distance in neighbors:
-                neighbor_tuple = tuple(neighbor)
-
-                if neighbor_tuple in closed_set:
-                    continue
-
-                tentative_g = curr_g + distance
-
-                if (neighbor_tuple not in g_scores or
-                    tentative_g < g_scores[neighbor_tuple]):
-
-                    g_scores[neighbor_tuple] = tentative_g
-                    f_score = tentative_g + self.get_heuristic(neighbor, target_np)
-                    f_scores[neighbor_tuple] = f_score
-
-                    new_path = curr_path + [neighbor_tuple]
-                    heapq.heappush(open_set, (f_score, neighbor_tuple, tentative_g, new_path))
-
-        return None, float('inf')
-
+    def get_all_coords(self) -> list[tuple]:
+        all_coords = []
+        # key: midpoint
+        # value: first, last, name, weight, connected_to, is_dead_end
+        for way_key, way_value in self.lines_data.items():
+            first_coord = way_value["first"]
+            last_coord = way_value["last"]
+            all_coords.append(first_coord)
+            all_coords.append(last_coord)
+        return all_coords
 
 def main():
     USER_HEADERS = {
@@ -537,22 +498,23 @@ def main():
     }
     gm_api_key          : str = get_gm_api_key()
     output_fp           : str = os.path.join(os.getcwd(), 'output')
-    pbf_file_path       : str = get_pbf_filepath()
-    gdf_data            : gpd.geodataframe.GeoDataFrame = get_all_gdf_data(pbf_file_path)
-    print("got gdf data for pbf file")
-
-    dataset_fp          : str = os.path.join(os.getcwd(), 'dataset')
-    gov_gdf_path        : str = get_latest_road_network(dataset_fp)
-    gov_gdf             : gpd.geodataframe.GeoDataFrame = get_all_gdf_data(gov_gdf_path, "CENTERLINE")
-    print('got gdf data for gov gdb')
-
     expressway_limits   : dict = get_expressway_limits(USER_HEADERS)
 
-    print()
-    print("-----")
+    pbf_file_path       : str = get_filepath_by_extension('.pbf')
+    pbf_gdf_lines = get_all_gdf_data(pbf_file_path)
 
-    osm_gdf             : OSM_GDF = OSM_GDF(gdf_data, gm_api_key, USER_HEADERS, gov_gdf, expressway_limits, start_time)
-    rb_kdtree           : KDTree = RB_KDTree(gm_api_key, gov_gdf, osm_gdf, 5)
+    gov_gdf_path = get_filepath_by_extension('.gdb')
+    gov_gdf = get_all_gdf_data(gov_gdf_path)
+
+    osm_gdf             : OSM_GDF = OSM_GDF(pbf_gdf_lines, gm_api_key, USER_HEADERS, gov_gdf, expressway_limits, start_time)
+    osm_lines_ways_data : dict = osm_gdf.get_lines_ways_data()
+
+    # sample_query = {
+    #     'start': (22.321584526395938, 113.93946781536052),
+    #     'target': (22.2853336, 114.1330190)
+    # }
+
+    # init_tree = initial_KDTree(sample_query, osm_lines_ways_data, osm_gdf, gov_gdf)
 
 
     # dev
