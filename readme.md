@@ -2,4 +2,4 @@ An A* routing engine for Hong Kong that weights roads by travel time, taking in 
 
 - Hong Kong road graph built from OSMnx data with assigned travel times per road edge
 - Penalties added for nodes that have traffic lights so routes choose a longer road rather than a road with dense amounts of signals
-- Routing visuals with Folium, and routes with GeoDataFrames for QGIS
+- Routing visuals using an interactive map with Folium on Streamlit

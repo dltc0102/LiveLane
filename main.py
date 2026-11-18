@@ -92,10 +92,12 @@ class RoutingEngine:
         self.penalty_seconds: int = 30
         self.congestion_factor: float = 1.1
         self.toll_penalty_seconds: int = 60
+        self.turn_penalty_seconds: int = 15
 
         self.client: httpx.AsyncClient  = client
         self.cache_path: str            = cache_path
-        self.graph: nx.MultiDiGraph     = self.load_graph()
+        self.full_graph: nx.MultiDiGraph = ox.load_graphml(self.cache_path) if os.path.exists(self.cache_path) else self.download_osmnx_data()
+        self.graph: nx.MultiDiGraph     = self._get_largest_component(self.full_graph)
         self.cached_traffic: dict[str, float] | None = None
 
         self.apply_static_penalties()
@@ -152,10 +154,18 @@ class RoutingEngine:
             
         return driving_data
 
+    @timer_decorator
+    def _get_largest_component(self, graph: nx.multidigraph):
+        try:
+            return ox.truncate.largest_component(graph, strongly=True)
+        except AttributeError:
+            return ox.utils_graph.get_largest_component(graph, strongly=True)
+        
     @timer_decorator 
     def apply_static_penalties(self) -> None:
         tl_count = 0
         toll_count = 0
+        turn_penalty_count = 0
         
         for u, v, k, edge_data in self.graph.edges(keys=True, data=True):
             # general congestion
@@ -173,9 +183,20 @@ class RoutingEngine:
                 edge_data['travel_time'] += self.toll_penalty_seconds
                 toll_count += 1
 
-        print(f"Applied {self.congestion_factor}x congestion factor.")
-        print(f"Added {self.penalty_seconds}s penalty to {tl_count} traffic lights.")
-        print(f"Added {self.toll_penalty_seconds}s penalty to {toll_count} tolls.")
+            # turn penalties: short turn edges, intersections, minor road merges to major roads
+            if edge_data.get('length', 0) < 50:
+                edge_data['travel_time'] += 10
+                turn_penalty_count += 1
+
+            if self.graph.degree[v] > 3:
+                edge_data['travel_time'] += 5
+                turn_penalty_count += 1
+
+            # taking minor roads means ease of driving goes down
+            highway = edge_data.get('highway', '')
+            if isinstance(highway, list): highway = highway[0]
+            if highway in ['residential', 'unclassified', 'service']:
+                edge_data['travel_time'] *= 1.3 
 
     @timer_decorator
     def enforce_physical_limits(self) -> None:
@@ -210,13 +231,8 @@ class RoutingEngine:
     def get_astar_route(self, start_coords: CoordDict, end_coords: CoordDict) -> list[NodeID]:
         start_node: NodeID = ox.distance.nearest_nodes(self.graph, X=start_coords['lon'], Y=start_coords['lat'])
         end_node: NodeID = ox.distance.nearest_nodes(self.graph, X=end_coords['lon'], Y=end_coords['lat'])
-
-        # --- DIAGNOSTIC ---
-        print(f"START NODE: {start_node} at ({self.graph.nodes[start_node]['y']}, {self.graph.nodes[start_node]['x']})")
-        print(f"END NODE:   {end_node} at ({self.graph.nodes[end_node]['y']}, {self.graph.nodes[end_node]['x']})")
-        print(f"GRAPH SIZE: {len(self.graph.nodes)} nodes, {len(self.graph.edges)} edges")
-        # ------------------
-
+        start_node_coord = (self.graph.nodes[start_node]['y'], self.graph.nodes[start_node]['x'])
+        end_node_coord = (self.graph.nodes[end_node]['y'], self.graph.nodes[end_node]['x'])
         route = nx.astar_path(
             self.graph, 
             start_node, 
@@ -225,18 +241,7 @@ class RoutingEngine:
             weight="travel_time"
         )
 
-        # --- DIAGNOSTIC: print each edge on the route ---
-        print("ROUTE EDGES (first 20):")
-        for i in range(min(20, len(route) - 1)):
-            u, v = route[i], route[i+1]
-            edge_data = self.graph[u][v][0]  # first key
-            hw = edge_data.get('highway', 'unknown')
-            length = edge_data.get('length', 0)
-            tt = edge_data.get('travel_time', 0)
-            print(f"  {u} -> {v}: hw={hw}, length={length:.1f}m, time={tt:.1f}s")
-        # ---------------------------------------------
-
-        return route
+        return route, start_node_coord, end_node_coord
 
     @timer_decorator
     def get_route_stats(self, route: list[NodeID]) -> tuple[float, float]:
@@ -332,7 +337,6 @@ async def main() -> None:
         engine: RoutingEngine = RoutingEngine(client=myclient)
         await engine.apply_live_traffic()
 
-        # test details
         home_details: CoordDict = {'lat': 22.3638, 'lon': 114.1791}
         belchers_details: CoordDict = {'lat': 22.2860, 'lon': 114.1329}
 

@@ -185,8 +185,8 @@ def lookup_sync(query: str, top_n: int = 8) -> list[tuple[str, float, float]]:
     return [(c.display(), c.lat, c.lon) for c in asyncio.run(_run())]
 
 
-st.set_page_config(page_title="HK Calculated Route", layout="wide")
-st.title("🇭🇰 Route Engine")
+st.set_page_config(page_title="LiveLane", layout="wide")
+st.title("LiveLane -- A* Route Engine")
 st.markdown("Find the fastest route using live TD traffic data and A* routing.")
 
 for key, default in {"start_coords": None, "end_coords": None, "route_results": None, "start_options": [], "end_options": [], "start_fetched": "", "end_fetched": ""}.items():
@@ -294,10 +294,27 @@ if st.session_state.route_results:
 
     route_gdf = ox.routing.route_to_gdf(graph, res['route'])
     for _, row in route_gdf.iterrows():
-        folium.PolyLine([(lat, lon) for lon, lat in row.geometry.coords], color="#00FFFF", weight=6).add_to(m)
+        folium.PolyLine(
+            [(lat, lon) for lon, lat in row.geometry.coords], 
+            color="#00FFFF", weight=6, opacity=0.8
+        ).add_to(m)
 
-    folium.Marker([start['lat'], start['lon']], icon=folium.Icon(color="green")).add_to(m)
-    folium.Marker([end['lat'], end['lon']], icon=folium.Icon(color="red")).add_to(m)
+    if res.get('start_snapped'):
+        folium.PolyLine(
+            [(start['lat'], start['lon']), (res['start_snapped']['lat'], res['start_snapped']['lon'])],
+            color="green", weight=4, dash_array='5, 10', 
+            tooltip="Walk to start point"
+        ).add_to(m)
+        
+    if res.get('end_snapped'):
+        folium.PolyLine(
+            [(res['end_snapped']['lat'], res['end_snapped']['lon']), (end['lat'], end['lon'])],
+            color="green", weight=4, dash_array='5, 10',
+            tooltip="Walk to destination"
+        ).add_to(m)
+
+    folium.Marker([start['lat'], start['lon']], icon=folium.Icon(color="green", icon="info-sign")).add_to(m)
+    folium.Marker([end['lat'], end['lon']], icon=folium.Icon(color="red", icon="info-sign")).add_to(m)
 
     m.fit_bounds(bounds)
     st_folium(m, width=1000, height=600)

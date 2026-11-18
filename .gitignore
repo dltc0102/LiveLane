@@ -5,7 +5,8 @@ test2.py
 line_nodes.txt
 old/*
 res.json
-*.json
+address_lookup.json
 __pycache_/*
 old/*
 cache/*
+*.__pycache_
