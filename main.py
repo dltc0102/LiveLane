@@ -88,7 +88,7 @@ def generate_map(graph: nx.MultiDiGraph, route: list[NodeID], center_coords: tup
 
 
 class RoutingEngine:
-    def __init__(self, client: httpx.AsyncClient, cache_path: str = "./data/hongkong_drive.graphml"):
+    def __init__(self, client: httpx.AsyncClient, cache_path: str = "./data/hongkong_full.graphml"):
         self.penalty_seconds: int = 30
         self.congestion_factor: float = 1.1
         self.toll_penalty_seconds: int = 60
@@ -96,24 +96,62 @@ class RoutingEngine:
 
         self.client: httpx.AsyncClient  = client
         self.cache_path: str            = cache_path
-        self.full_graph: nx.MultiDiGraph = ox.load_graphml(self.cache_path) if os.path.exists(self.cache_path) else self.download_osmnx_data()
-        self.graph: nx.MultiDiGraph     = self._get_largest_component(self.full_graph)
-        self.cached_traffic: dict[str, float] | None = None
+        
+        if os.path.exists(self.cache_path):
+            self.full_graph = ox.load_graphml(self.cache_path)
+        else:
+            self.full_graph = self.download_osmnx_data()
+            os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
+            ox.save_graphml(self.full_graph, filepath=self.cache_path)
 
+        drive_edges = [(u, v, k) for u, v, k, d in self.full_graph.edges(keys=True, data=True) if self._is_driveable(d)]
+        self.drive_graph = self.full_graph.edge_subgraph(drive_edges).copy()
+        self.drive_graph.remove_nodes_from(list(nx.isolates(self.drive_graph)))
+        self.graph: nx.MultiDiGraph = self._get_largest_component(self.drive_graph)
+        
+        self.cached_traffic: dict[str, float] | None = None
         self.apply_static_penalties()
         self.enforce_physical_limits()
 
+    @staticmethod
+    def _is_driveable(d: dict) -> bool:
+        hway = d.get('highway', '')
+        if isinstance(hway, list): hway = ' '.join(hway)
+        hway = hway.lower()
+
+        allowed = {
+            'motorway','motorway_link','trunk','trunk_link','primary','primary_link',
+            'secondary','secondary_link','tertiary','tertiary_link',
+            'unclassified','residential','living_street'
+        }
+        
+        hway_tokens = set(hway.split())
+        if not (hway_tokens & allowed): return False
+        if d.get('motor_vehicle') in ('no', False): return False
+        if d.get('motorcar') in ('no', False): return False
+        if d.get('access') in ('private', 'no'): return False
+        if 'ferry' in str(d.get('route', '')).lower(): return False
+        return True
+    
+    @staticmethod
+    def _is_walkable(d: dict) -> bool:
+        hway = d.get('highway', '')
+        if isinstance(hway, list): hway = ' '.join(hway)
+        hway = hway.lower()
+        if not hway: return False
+        if d.get('foot') in ('no', False): return False
+        if d.get('access') == 'private': return False
+        if 'ferry' in str(d.get('route', '')).lower(): return False
+        return True
+    
     @timer_decorator
     def download_osmnx_data(self, network_origin: str = "Hong Kong", modal: str = "drive"):
         custom_filter = (
-            '["highway"~"motorway|trunk|primary|secondary|tertiary|unclassified|residential|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link"]'
+            '["highway"]'
             '["area"!~"yes"]'
-            '["motor_vehicle"!~"no"]'
-            '["motorcar"!~"no"]'
-            '["access"!~"private"]'
             '["route"!~"ferry"]'
         )
-        data = ox.graph.graph_from_place(network_origin, network_type=modal, custom_filter=custom_filter)
+        data = ox.graph.graph_from_place(network_origin, network_type="all", custom_filter=custom_filter)
         data = ox.add_edge_speeds(data)
         data = ox.add_edge_travel_times(data)
         return data
@@ -185,18 +223,18 @@ class RoutingEngine:
 
             # turn penalties: short turn edges, intersections, minor road merges to major roads
             if edge_data.get('length', 0) < 50:
-                edge_data['travel_time'] += 10
+                edge_data['travel_time'] += 2
                 turn_penalty_count += 1
 
             if self.graph.degree[v] > 3:
-                edge_data['travel_time'] += 5
+                edge_data['travel_time'] += 2
                 turn_penalty_count += 1
 
             # taking minor roads means ease of driving goes down
-            highway = edge_data.get('highway', '')
-            if isinstance(highway, list): highway = highway[0]
-            if highway in ['residential', 'unclassified', 'service']:
-                edge_data['travel_time'] *= 1.3 
+            # highway = edge_data.get('highway', '')
+            # if isinstance(highway, list): highway = highway[0]
+            # if highway in ['residential', 'unclassified', 'service']:
+            #     edge_data['travel_time'] *= 1.3 
 
     @timer_decorator
     def enforce_physical_limits(self) -> None:
@@ -226,22 +264,62 @@ class RoutingEngine:
         dist_km: float = haversine((lat_current, lon_current), (lat_target, lon_target))
         max_speed: int = 80
         return (dist_km / max_speed) * 3600
-
+    
     @timer_decorator
-    def get_astar_route(self, start_coords: CoordDict, end_coords: CoordDict) -> list[NodeID]:
-        start_node: NodeID = ox.distance.nearest_nodes(self.graph, X=start_coords['lon'], Y=start_coords['lat'])
-        end_node: NodeID = ox.distance.nearest_nodes(self.graph, X=end_coords['lon'], Y=end_coords['lat'])
-        start_node_coord = (self.graph.nodes[start_node]['y'], self.graph.nodes[start_node]['x'])
-        end_node_coord = (self.graph.nodes[end_node]['y'], self.graph.nodes[end_node]['x'])
-        route = nx.astar_path(
-            self.graph, 
-            start_node, 
-            end_node, 
-            heuristic=self.create_heuristics, 
-            weight="travel_time"
+    def get_astar_route(self, start_coords: CoordDict, end_coords: CoordDict, preferences: dict | None = None) -> tuple:
+        prefs = preferences or {}
+
+        u_start = ox.distance.nearest_nodes(self.graph, X=start_coords['lon'], Y=start_coords['lat'])
+        u_end = ox.distance.nearest_nodes(self.graph, X=end_coords['lon'], Y=end_coords['lat'])
+
+        start_walk_coords = [
+            [start_coords['lat'], start_coords['lon']],
+            [self.graph.nodes[u_start]['y'], self.graph.nodes[u_start]['x']],
+        ]
+        end_walk_coords = [
+            [self.graph.nodes[u_end]['y'], self.graph.nodes[u_end]['x']],
+            [end_coords['lat'], end_coords['lon']],
+        ]
+
+        def weight_func(u, v, d):
+            weights = []
+            for k, edge_data in d.items():
+                base = edge_data.get('travel_time', 1)
+                if prefs.get("avoid_lights") and self.graph.nodes[v].get('highway') == 'traffic_signals':
+                    base += 120
+                if prefs.get("avoid_turns") and edge_data.get('length', 0) < 50:
+                    base += 60
+                weights.append(base)
+            return min(weights)
+        
+        route_nodes = nx.astar_path(
+            self.graph, u_start, u_end,
+            heuristic=self.create_heuristics,
+            weight=weight_func,
         )
 
-        return route, start_node_coord, end_node_coord
+        route_edges = []
+        traffic_lights = 0
+        turns = 0
+
+        for u, v in zip(route_nodes[:-1], route_nodes[1:]):
+            d = self.graph[u][v]
+            best_k = min(d.keys(), key=lambda k: d[k].get('travel_time', float('inf')))
+            route_edges.append((u, v, best_k))
+            
+            # count traffic lights
+            if self.graph.nodes[v].get('highway') == 'traffic_signals' or self.graph.nodes[v].get('traffic_signals') == 'yes':
+                traffic_lights += 1
+            
+            # count turns 
+            edge_data = d[best_k]
+            if edge_data.get('length', 0) < 50:
+                turns += 1
+
+        start_node_coord = (self.graph.nodes[u_start]['y'], self.graph.nodes[u_start]['x'])
+        end_node_coord   = (self.graph.nodes[u_end]['y'],   self.graph.nodes[u_end]['x'])
+
+        return route_nodes, route_edges, start_node_coord, end_node_coord, start_walk_coords, end_walk_coords, traffic_lights, turns
 
     @timer_decorator
     def get_route_stats(self, route: list[NodeID]) -> tuple[float, float]:
@@ -340,7 +418,7 @@ async def main() -> None:
         home_details: CoordDict = {'lat': 22.3638, 'lon': 114.1791}
         belchers_details: CoordDict = {'lat': 22.2860, 'lon': 114.1329}
 
-        route: list[NodeID] = engine.get_astar_route(home_details, belchers_details)
+        route, _, start_coord, end_coord, start_walk, end_walk, _, _ = engine.get_astar_route(home_details, belchers_details)
         total_time, total_dist = engine.get_route_stats(route)
         print(f"Result: {len(route)} nodes, {total_time/60:.1f} min, {total_dist/1000:.2f} km")
 

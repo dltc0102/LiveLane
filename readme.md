@@ -1,5 +1,6 @@
-An A* routing engine for Hong Kong that weights roads by travel time, taking in considerations of road class, traffic-signal delays and live data from the Transport Department instead of distance with an interactive map visualiser. 
+# LiveLane — A* Routing Engine for Hong Kong
 
-- Hong Kong road graph built from OSMnx data with assigned travel times per road edge
-- Penalties added for nodes that have traffic lights so routes choose a longer road rather than a road with dense amounts of signals
-- Routing visuals using an interactive map with Folium on Streamlit
+An A* Routing Engine that finds the fastest route across Hong Kong by weighting road segments by travel time. It factors in road class, traffic-signal delays, toll costs, turn penalties, congestion factors, and live traffic speed data from Hong Kong Transport Department, with an interactive Folium map on a Stremalit frontend.
+
+Backend: http://localhost:8000/docs
+Frontend: http://localhost:8501

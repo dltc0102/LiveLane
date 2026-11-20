@@ -3,10 +3,11 @@ apikey.txt
 test.py
 test2.py
 line_nodes.txt
-old/*
 res.json
 address_lookup.json
 __pycache_/*
 old/*
 cache/*
 *.__pycache_
+*.pyc
+graph.py

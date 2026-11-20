@@ -20,27 +20,43 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# pydantic models
 class CoordModel(BaseModel):
     lat: float
     lon: float
-
-class RouteRequest(BaseModel):
-    start: CoordModel
-    end: CoordModel
-
-class RouteResponse(BaseModel):
-    time_min: float
-    dist_km: float
-    route: list[int]
-    start_snapped: dict[str, float]
-    end_snapped: dict[str, float]
-    tunnel_bridge_edges: list[list[int]]
 
 class AddressResult(BaseModel):
     display_text: str
     lat: float
     lon: float
 
+class RoutePreferences(BaseModel):
+    avoid_lights: bool = False
+    avoid_turns: bool = True
+
+class RouteRequest(BaseModel):
+    start: CoordModel
+    end: CoordModel
+    preferences: RoutePreferences = RoutePreferences()
+
+class RouteResponse(BaseModel):
+    time_min: float
+    dist_km: float
+    route: list[int]
+    start_walk_path: list[list[float]] # list of lat lon sublists
+    end_walk_path: list[list[float]]
+    start_snapped: dict[str, float]
+    end_snapped: dict[str, float]
+    route_geometry: list[dict]
+    traffic_lights: int
+    turns: int
+    lights_delta: int
+    turns_delta: int
+    lights_time_delta: float
+    turns_time_delta: float
+
+
+# endpoints
 @app.get("/geocode", response_model=list[AddressResult])
 async def geocode_address(q: str):
     url = f"https://www.map.gov.hk/gs/api/v1.0.0/locationSearch?q={quote(q)}"
@@ -72,31 +88,58 @@ async def calculate_route(req: RouteRequest):
     end_dict = {'lat': req.end.lat, 'lon': req.end.lon}
     
     try:
-        route, start_node_coord, end_node_coord = engine.get_astar_route(start_dict, end_dict)
-        
+        # current route
+        route, route_edges, start_node_coord, end_node_coord, start_walk_coords, end_walk_coords, current_lights, current_turns = engine.get_astar_route(
+            start_dict, end_dict, preferences=req.preferences.model_dump()
+        )
         if not route:
             raise HTTPException(status_code=404, detail="No driving route found between these points")
-            
         total_time, total_dist = engine.get_route_stats(route)
-        tunnel_bridge_edges = []
+
+        # lights
+        opp_lights_prefs = {"avoid_lights": not req.preferences.avoid_lights, "avoid_turns": req.preferences.avoid_turns}
+        opp_l_route, _, _, _, _, _, opp_l_lights, _ = engine.get_astar_route(start_dict, end_dict, preferences=opp_lights_prefs)
+        opp_l_time, _ = engine.get_route_stats(opp_l_route) if opp_l_route else (total_time, 0)
+
+        # turns
+        opp_turns_prefs = {"avoid_lights": req.preferences.avoid_lights, "avoid_turns": not req.preferences.avoid_turns}
+        opp_t_route, _, _, _, _, _, _, opp_t_turns = engine.get_astar_route(start_dict, end_dict, preferences=opp_turns_prefs)
+        opp_t_time, _ = engine.get_route_stats(opp_t_route) if opp_t_route else (total_time, 0)
+
+        # all deltas
+        lights_delta = current_lights - opp_l_lights
+        turns_delta = current_turns - opp_t_turns
+        lights_time_delta = total_time - opp_l_time #s
+        turns_time_delta = total_time - opp_t_time #s
         
-        for i in range(len(route) - 1):
-            u, v = route[i], route[i+1]
-            edge_data = engine.graph.get_edge_data(u, v)
-            if edge_data:
-                data = list(edge_data.values())[0]
-                is_tunnel = data.get('tunnel') in [True, 'yes', 'building_passage']
-                is_bridge = data.get('bridge') in [True, 'yes']
-                if is_tunnel or is_bridge:
-                    tunnel_bridge_edges.append([u, v])
-        
+        route_geometry = []
+        for u, v, k in route_edges:
+            data = engine.graph[u][v][k]
+            tunnel_val = str(data.get('tunnel', '')).lower()
+            bridge_val = str(data.get('bridge', '')).lower()
+            is_tunnel = tunnel_val in ['yes', 'true', 'building_passage'] or bridge_val in ['yes', 'true']
+            
+            if 'geometry' in data:
+                coords = [[lat, lon] for lon, lat in data['geometry'].coords]
+            else:
+                coords = [
+                    [engine.graph.nodes[u]['y'], engine.graph.nodes[u]['x']],
+                    [engine.graph.nodes[v]['y'], engine.graph.nodes[v]['x']]
+                ]
+            
+            route_geometry.append({ "coords": coords, "is_tunnel": is_tunnel })
+
         return RouteResponse(
-            time_min=total_time / 60,
-            dist_km=total_dist / 1000,
-            route=route,
+            time_min=total_time / 60, dist_km=total_dist / 1000, route=route,
+            start_walk_path=start_walk_coords, end_walk_path=end_walk_coords,
             start_snapped={"lat": start_node_coord[0], "lon": start_node_coord[1]},
             end_snapped={"lat": end_node_coord[0], "lon": end_node_coord[1]},
-            tunnel_bridge_edges=tunnel_bridge_edges
+            route_geometry=route_geometry,
+            traffic_lights=current_lights, turns=current_turns,
+            lights_delta=lights_delta, turns_delta=turns_delta,
+            lights_time_delta=lights_time_delta, turns_time_delta=turns_time_delta
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
